@@ -4,32 +4,55 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"regexp"
-	"strconv"
 	"time"
 )
 
-const (
-	homeUrl = "https://www.meetup.com/find"
-	gqlUrl  = "https://www.meetup.com/gql2"
-)
+const gqlUrl = "https://www.meetup.com/gql2"
 
 type Meetup struct {
 	log *slog.Logger
 	cli *http.Client
 }
 
-type MeetupQueryVars struct {
-	First             int     `json:"first"`
-	Lat               float64 `json:"lat"`
-	Lon               float64 `json:"lon"`
-	DataConfiguration string  `json:"dataConfiguration"`
+// TopicCategory are the categories that Meetup sorts events into.
+type TopicCategory string
+
+const (
+	NewGroups            TopicCategory = "-999"
+	SocialActivities     TopicCategory = "652"
+	Hobbies              TopicCategory = "571"
+	Sports               TopicCategory = "482"
+	TravelOutdoors       TopicCategory = "684"
+	Career               TopicCategory = "405"
+	Technology           TopicCategory = "546"
+	Community            TopicCategory = "604"
+	IdentityLanguage     TopicCategory = "622"
+	Games                TopicCategory = "535"
+	Dance                TopicCategory = "612"
+	Coaching             TopicCategory = "449"
+	Music                TopicCategory = "395"
+	Health               TopicCategory = "511"
+	Art                  TopicCategory = "521"
+	Science              TopicCategory = "436"
+	Pets                 TopicCategory = "701"
+	ReligionSpirituality TopicCategory = "593"
+	Writing              TopicCategory = "467"
+	Parents              TopicCategory = "673"
+	Politics             TopicCategory = "642"
+)
+
+type RecommendedEventsVariables struct {
+	First             int           `json:"first"`
+	Lat               float64       `json:"lat"`
+	Lon               float64       `json:"lon"`
+	DataConfiguration string        `json:"dataConfiguration"`
+	TopicCategory     TopicCategory `json:"topicCategoryId,omitzero"`
+	// This should always be "RELEVANCE"
+	SortField string `json:"sortField"`
 }
 
 type PersistedQuery struct {
@@ -44,17 +67,51 @@ type MeetupExtensions struct {
 type OperationName string
 
 const (
+	LocationSearch              OperationName = "getLocationSearch"
 	RecommendedEventsWithSeries OperationName = "recommendedEventsWithSeries"
 )
 
 type MeetupOperation struct {
 	OperationName OperationName    `json:"operationName"`
-	Variables     MeetupQueryVars  `json:"variables"`
+	Variables     any              `json:"variables"`
 	Extensions    MeetupExtensions `json:"extensions"`
 }
 
+type LocationSearchResult struct {
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
+}
+
+type LocationSearchResponse struct {
+	Data struct {
+		Result []LocationSearchResult `json:"result"`
+	} `json:"data"`
+}
+
+type Event struct {
+	Title       string    `json:"title"`
+	DateTime    time.Time `json:"dateTime"`
+	Description string    `json:"description"`
+	EventType   EventType `json:"eventType"`
+	EventUrl    string    `json:"eventUrl"`
+}
+
 type RecommendedEventsResponse struct {
-	Data DataPayload `json:"data"`
+	Data struct {
+		Result Result `json:"result"`
+	}
+}
+
+// ScrapeVars are options that can be passed into the meetup scrap function call.
+type ScrapeVars struct {
+	// Lat is the latitude to search around
+	Lat float64
+	// Lon is the longitude to search around
+	Lon float64
+	// Size is the number of events to return
+	Size int
+	// Cursor is the cursor for a specific page of result
+	Cursor string
 }
 
 type DataPayload struct {
@@ -84,11 +141,22 @@ const (
 	Physical EventType = "PHYSICAL"
 )
 
-type Event struct {
-	Title       string    `json:"title"`
-	DateTime    time.Time `json:"dateTime"`
-	Description string    `json:"description"`
-	EventType   EventType `json:"eventType"`
+func newOperation(name OperationName, vars any) MeetupOperation {
+	return MeetupOperation{
+		OperationName: name,
+		Variables:     vars,
+		Extensions: MeetupExtensions{
+			PersistedQuery: PersistedQuery{
+				Version:    1,
+				Sha256Hash: OperationShaMap[name],
+			},
+		},
+	}
+}
+
+var OperationShaMap = map[OperationName]string{
+	RecommendedEventsWithSeries: "3f7480361301be1b3208df0cd724930a22f7741d3c24666ab5b37a381ff4e0e8",
+	LocationSearch:              "9c04de696e6a6697b82523524e59c52448f569689ed93b0821c9ff6437dc2089",
 }
 
 func (e *EventType) MarshalJSON() ([]byte, error) {
@@ -109,8 +177,6 @@ func (e *EventType) UnmarshalJSON(bytes []byte) error {
 	return fmt.Errorf("got unknown event type: %s", resString)
 }
 
-const recommendedEventsHash = "3f7480361301be1b3208df0cd724930a22f7741d3c24666ab5b37a381ff4e0e8"
-
 func NewMeetup() *Meetup {
 	cli := &http.Client{
 		Timeout: 15 * time.Second,
@@ -123,69 +189,44 @@ func NewMeetup() *Meetup {
 	}
 }
 
-func (m *Meetup) getLatAndLon(ctx context.Context) (lat float64, lon float64, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, homeUrl, nil)
+func (m *Meetup) GetLatAndLon(ctx context.Context) (float64, float64, error) {
+	op := newOperation(LocationSearch, struct{}{})
+	body, err := json.Marshal(op)
 	if err != nil {
-		return 0, 0, fmt.Errorf("error forming request: %w", err)
+		return 0, 0, fmt.Errorf("error marshalling location search payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gqlUrl, bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, fmt.Errorf("error forming location search request: %w", err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Content-Type", "application/json")
 	res, err := m.cli.Do(req)
 	if err != nil {
-		return 0, 0, fmt.Errorf("error reading response: %w", err)
+		return 0, 0, fmt.Errorf("error performing location search request: %w", err)
 	}
 	defer res.Body.Close()
-	bytes, err := io.ReadAll(res.Body)
-	if err != nil {
-		return 0, 0, fmt.Errorf("error getting home bytes: %w", err)
+	var locationRes LocationSearchResponse
+	if err = json.NewDecoder(res.Body).Decode(&locationRes); err != nil {
+		return 0, 0, fmt.Errorf("error decoding location search response: %w", err)
 	}
-	// TODO: remove these test files
-	err = os.WriteFile("meetup_captured.html", bytes, 0666)
-	if err != nil {
-		return 0, 0, fmt.Errorf("error writing home file: %w", err)
+	if len(locationRes.Data.Result) == 0 {
+		return 0, 0, fmt.Errorf("no location results returned")
 	}
-	latRe := regexp.MustCompile(`"lat":\s*([-\d.]+)`)
-	lonRe := regexp.MustCompile(`"lon":\s*([-\d.]+)`)
-	if match := latRe.FindSubmatch(bytes); match != nil {
-		lat, err = strconv.ParseFloat(string(match[1]), 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("error parsing lat: %w", err)
-		}
-		m.log.Debug("found lat", slog.Float64("lat", lat))
-	} else {
-		return 0, 0, errors.New("latitude not found from meetup")
-	}
-	if match := lonRe.FindSubmatch(bytes); match != nil {
-		lon, err = strconv.ParseFloat(string(match[1]), 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("error parsing lon: %w", err)
-		}
-		m.log.Debug("found lon", slog.Float64("lon", lon))
-	} else {
-		return 0, 0, errors.New("longitude not found from meetup")
-	}
-	return lat, lon, nil
+	result := locationRes.Data.Result[0]
+	m.log.Debug("found location", slog.Float64("lat", result.Lat), slog.Float64("lon", result.Lon))
+	return result.Lat, result.Lon, nil
 }
 
-func (m *Meetup) Scrape(ctx context.Context) error {
-	lat, lon, err := m.getLatAndLon(ctx)
-	if err != nil {
-		return fmt.Errorf("error trying to fetch lat and lon from meetup: %w", err)
-	}
-	op := MeetupOperation{
-		OperationName: RecommendedEventsWithSeries,
-		Variables: MeetupQueryVars{
-			First:             12,
-			Lat:               lat,
-			Lon:               lon,
-			DataConfiguration: `{"isSimplifiedSearchEnabled":true}`,
-		},
-		Extensions: MeetupExtensions{
-			PersistedQuery: PersistedQuery{
-				Version:    1,
-				Sha256Hash: recommendedEventsHash,
-			},
-		},
-	}
+func (m *Meetup) Scrape(ctx context.Context, scrapeVars ScrapeVars) error {
+	op := newOperation(RecommendedEventsWithSeries, RecommendedEventsVariables{
+		First:             scrapeVars.Size,
+		Lat:               scrapeVars.Lat,
+		Lon:               scrapeVars.Lon,
+		DataConfiguration: `{"isSimplifiedSearchEnabled":true}`,
+		TopicCategory:     Games,
+		SortField:         "RELEVANCE",
+	})
 	body, err := json.Marshal(op)
 	if err != nil {
 		return fmt.Errorf("error marshalling gql payload: %w", err)
@@ -202,14 +243,24 @@ func (m *Meetup) Scrape(ctx context.Context) error {
 	}
 	defer res.Body.Close()
 	m.log.Debug("Got response from gql", slog.Int("statusCode", res.StatusCode))
-	gqlData, err := io.ReadAll(res.Body)
+	dec := json.NewDecoder(res.Body)
+	var rer RecommendedEventsResponse
+	err = dec.Decode(&rer)
 	if err != nil {
-		return fmt.Errorf("error getting gql bytes: %w", err)
+		return fmt.Errorf("error decoding response: %w", err)
 	}
-	// TODO: remove these test files
-	err = os.WriteFile("meetup_gql.json", gqlData, 0666)
+	// TODO: remove this debug file
+	file, err := os.Create("test_decoded.json")
 	if err != nil {
-		return fmt.Errorf("error writing gql bytes: %w", err)
+		return fmt.Errorf("error with creating test_decoded.json: %w", err)
 	}
+	defer file.Close()
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "    ")
+	err = enc.Encode(rer)
+	if err != nil {
+		return fmt.Errorf("error with encoding to file: %w", err)
+	}
+	m.log.Debug("Scrape completed successfully", slog.Int("event_size", len(rer.Data.Result.Events)))
 	return nil
 }
